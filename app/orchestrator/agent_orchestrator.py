@@ -1,108 +1,119 @@
-"""Agent orchestrator using LangGraph for routing and state management."""
-from typing import TypedDict, Annotated, Literal
+"""Enhanced agent orchestrator using routing agent and planner/executor pattern."""
+from typing import TypedDict, Literal, Optional
 from langgraph.graph import StateGraph, END
-from app.agents.booking.booking_agent import booking_agent
-from app.agents.properties_agent import properties_agent
-from app.agents.education_agent import education_agent
-from app.models.schemas import AgentRequest, AgentResponse
-from app.utils.llm_client import llm_client
+from app.agents.routing_agent import routing_agent
+from app.agents.booking.booking_planner import booking_planner
+from app.agents.booking.booking_executor import booking_executor
+from app.agents.properties.properties_planner import properties_planner
+from app.agents.properties.properties_executor import properties_executor
+from app.agents.education.education_planner import education_planner
+from app.agents.education.education_executor import education_executor
+from app.models.plan_schemas import (
+    PlannerRequest, ExecutorRequest, ActionPlan, RoutingDecision
+)
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class AgentState(TypedDict):
-    """State for the agent orchestrator graph."""
+    """State for the enhanced agent orchestrator graph."""
     query: str
     session_id: str
     context: dict
-    intent: str
+    routing_decision: Optional[RoutingDecision]
+    domain: str
+    action_plan: Optional[ActionPlan]
+    current_step_id: Optional[str]
+    user_input: Optional[str]
     agent_response: str
     requires_followup: bool
     metadata: dict
 
 
-class AgentOrchestrator:
-    """Orchestrates multiple agents using LangGraph."""
+class EnhancedAgentOrchestrator:
+    """Orchestrates agents using routing agent and planner/executor pattern."""
     
     def __init__(self):
-        """Initialize the orchestrator with all agents."""
-        self.agents = {
-            "booking": booking_agent,
-            "properties": properties_agent,
-            "education": education_agent,
+        """Initialize the enhanced orchestrator."""
+        self.routing_agent = routing_agent
+        
+        # Planner agents
+        self.planners = {
+            "booking": booking_planner,
+            "properties": properties_planner,
+            "education": education_planner,
         }
+        
+        # Executor agents
+        self.executors = {
+            "booking": booking_executor,
+            "properties": properties_executor,
+            "education": education_executor,
+        }
+        
         self.graph = self._build_graph()
     
     def _build_graph(self) -> StateGraph:
-        """Build the LangGraph workflow."""
+        """Build the enhanced LangGraph workflow."""
         workflow = StateGraph(AgentState)
         
         # Add nodes
-        workflow.add_node("classify_intent", self._classify_intent)
-        workflow.add_node("route_to_agent", self._route_to_agent)
+        workflow.add_node("route_query", self._route_query)
+        workflow.add_node("create_plan", self._create_plan)
+        workflow.add_node("execute_plan", self._execute_plan)
         workflow.add_node("handle_unclear", self._handle_unclear_intent)
         
         # Add edges
-        workflow.set_entry_point("classify_intent")
+        workflow.set_entry_point("route_query")
         workflow.add_conditional_edges(
-            "classify_intent",
-            self._should_route_to_agent,
+            "route_query",
+            self._should_create_plan,
             {
-                "route": "route_to_agent",
+                "plan": "create_plan",
                 "unclear": "handle_unclear"
             }
         )
-        workflow.add_edge("route_to_agent", END)
+        workflow.add_edge("create_plan", "execute_plan")
+        workflow.add_edge("execute_plan", END)
         workflow.add_edge("handle_unclear", END)
         
         return workflow.compile()
     
-    async def _classify_intent(self, state: AgentState) -> AgentState:
+    async def _route_query(self, state: AgentState) -> AgentState:
         """
-        Classify user intent to determine which agent should handle the request.
+        Route query using the routing agent.
         
         Args:
             state: Current agent state
             
         Returns:
-            Updated state with intent classification
+            Updated state with routing decision
         """
-        query = state["query"]
-        
-        classification_prompt = f"""Classify the following user query into one of these categories:
-- booking: Restaurant reservations, dining recommendations, table bookings
-- properties: Real estate search, property listings, housing, apartments, rentals
-- education: Schools, educational resources, children profiles, school districts
-- unclear: Cannot determine or doesn't fit any category
-
-User query: "{query}"
-
-Respond with ONLY the category name (booking, properties, education, or unclear).
-"""
-        
         try:
-            messages = [{"role": "user", "content": classification_prompt}]
-            intent = await llm_client.generate_response(messages)
-            intent = intent.strip().lower()
+            routing_decision = await self.routing_agent.route(
+                query=state["query"],
+                session_id=state["session_id"],
+                context=state["context"]
+            )
             
-            # Validate intent
-            valid_intents = ["booking", "properties", "education", "unclear"]
-            if intent not in valid_intents:
-                intent = "unclear"
+            state["routing_decision"] = routing_decision
+            state["domain"] = routing_decision.domain
             
-            logger.info(f"Classified intent: {intent} for query: {query}")
-            state["intent"] = intent
+            logger.info(
+                f"Routing decision: domain={routing_decision.domain}, "
+                f"confidence={routing_decision.confidence}"
+            )
             
         except Exception as e:
-            logger.error(f"Error classifying intent: {e}")
-            state["intent"] = "unclear"
+            logger.error(f"Error in routing: {e}")
+            state["domain"] = "unclear"
         
         return state
     
-    def _should_route_to_agent(self, state: AgentState) -> Literal["route", "unclear"]:
+    def _should_create_plan(self, state: AgentState) -> Literal["plan", "unclear"]:
         """
-        Determine if query should be routed to an agent or handled as unclear.
+        Determine if we should create a plan or handle as unclear.
         
         Args:
             state: Current agent state
@@ -110,53 +121,110 @@ Respond with ONLY the category name (booking, properties, education, or unclear)
         Returns:
             Routing decision
         """
-        if state["intent"] in ["booking", "properties", "education"]:
-            return "route"
+        domain = state.get("domain", "unclear")
+        if domain in ["booking", "properties", "education"]:
+            return "plan"
         return "unclear"
     
-    async def _route_to_agent(self, state: AgentState) -> AgentState:
+    async def _create_plan(self, state: AgentState) -> AgentState:
         """
-        Route the query to the appropriate agent.
+        Create an action plan using the appropriate planner.
         
         Args:
             state: Current agent state
             
         Returns:
-            Updated state with agent response
+            Updated state with action plan
         """
-        intent = state["intent"]
-        agent = self.agents.get(intent)
+        domain = state["domain"]
+        planner = self.planners.get(domain)
         
-        if not agent:
-            logger.error(f"No agent found for intent: {intent}")
+        if not planner:
+            logger.error(f"No planner found for domain: {domain}")
+            state["domain"] = "unclear"
+            return state
+        
+        try:
+            # Create planner request
+            planner_request = PlannerRequest(
+                query=state["query"],
+                session_id=state["session_id"],
+                context=state["context"],
+                domain=domain
+            )
+            
+            # Get plan from planner
+            planner_response = await planner.plan(planner_request)
+            
+            state["action_plan"] = planner_response.plan
+            state["metadata"] = {
+                "planner_confidence": planner_response.confidence,
+                "planner_reasoning": planner_response.reasoning,
+                "requires_clarification": planner_response.requires_clarification
+            }
+            
+            logger.info(
+                f"Created plan for {domain}: {len(planner_response.plan.steps)} steps, "
+                f"confidence={planner_response.confidence}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error creating plan: {e}")
+            state["domain"] = "unclear"
+        
+        return state
+    
+    async def _execute_plan(self, state: AgentState) -> AgentState:
+        """
+        Execute the action plan using the appropriate executor.
+        
+        Args:
+            state: Current agent state
+            
+        Returns:
+            Updated state with execution results
+        """
+        domain = state["domain"]
+        executor = self.executors.get(domain)
+        
+        if not executor or not state.get("action_plan"):
+            logger.error(f"No executor or plan for domain: {domain}")
             state["agent_response"] = "I apologize, but I couldn't process your request."
             state["requires_followup"] = False
             return state
         
         try:
-            # Create agent request
-            request = AgentRequest(
-                query=state["query"],
+            # Create executor request
+            executor_request = ExecutorRequest(
+                plan=state["action_plan"],
+                current_step_id=state.get("current_step_id"),
+                user_input=state.get("user_input"),
                 session_id=state["session_id"],
                 context=state["context"]
             )
             
-            # Process with agent
-            response: AgentResponse = await agent.process(request)
+            # Execute plan
+            executor_response = await executor.execute(executor_request)
             
-            # Update state
-            state["agent_response"] = response.content
-            state["requires_followup"] = response.requires_followup
-            state["metadata"] = {
-                "agent": response.agent_name,
-                **response.metadata
-            }
+            state["agent_response"] = executor_response.content
+            state["requires_followup"] = executor_response.requires_user_input
+            state["metadata"].update({
+                "executor_metadata": executor_response.metadata,
+                "plan_completed": executor_response.plan_completed,
+                "completed_steps": executor_response.completed_steps,
+                "current_step_id": executor_response.current_step_id,
+                "next_step_id": executor_response.next_step_id
+            })
             
-            logger.info(f"Agent {response.agent_name} processed request successfully")
+            logger.info(
+                f"Executed plan for {domain}: "
+                f"completed={executor_response.plan_completed}, "
+                f"requires_input={executor_response.requires_user_input}"
+            )
             
         except Exception as e:
-            logger.error(f"Error routing to agent: {e}")
-            state["agent_response"] = "I apologize, but I encountered an error processing your request."
+            logger.error(f"Error executing plan: {e}")
+            state["agent_response"] = "I encountered an error processing your request. Please try again."
             state["requires_followup"] = False
         
         return state
@@ -171,7 +239,15 @@ Respond with ONLY the category name (booking, properties, education, or unclear)
         Returns:
             Updated state with clarification request
         """
-        clarification = """I'd be happy to help! I can assist you with:
+        routing_decision = state.get("routing_decision")
+        
+        if routing_decision:
+            clarification = await self.routing_agent.get_clarification_message(
+                state["query"],
+                routing_decision
+            )
+        else:
+            clarification = """I'd be happy to help! I can assist you with:
 
 🍽️ **Restaurant Bookings** - Find and reserve tables at restaurants
 🏠 **Property Search** - Search for apartments, houses, and rentals  
@@ -189,15 +265,19 @@ Could you please clarify what you're looking for?"""
         self,
         query: str,
         session_id: str,
-        context: dict = None
+        context: dict = None,
+        current_step_id: str = None,
+        user_input: str = None
     ) -> dict:
         """
-        Process a user query through the orchestrator.
+        Process a user query through the enhanced orchestrator.
         
         Args:
             query: User query
             session_id: Session identifier
             context: Optional conversation context
+            current_step_id: Current step ID for multi-turn conversations
+            user_input: User input for current step
             
         Returns:
             Dictionary with response and metadata
@@ -207,7 +287,11 @@ Could you please clarify what you're looking for?"""
             "query": query,
             "session_id": session_id,
             "context": context or {},
-            "intent": "",
+            "routing_decision": None,
+            "domain": "",
+            "action_plan": None,
+            "current_step_id": current_step_id,
+            "user_input": user_input,
             "agent_response": "",
             "requires_followup": False,
             "metadata": {}
@@ -218,11 +302,11 @@ Could you please clarify what you're looking for?"""
         
         return {
             "response": final_state["agent_response"],
-            "intent": final_state["intent"],
+            "intent": final_state["domain"],
             "requires_followup": final_state["requires_followup"],
             "metadata": final_state["metadata"]
         }
 
 
-# Global orchestrator instance
-orchestrator = AgentOrchestrator()
+# Global enhanced orchestrator instance
+orchestrator = EnhancedAgentOrchestrator()

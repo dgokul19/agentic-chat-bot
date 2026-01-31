@@ -69,17 +69,7 @@
             width: 10px;
             height: 10px;
             border-radius: 50%;
-            background: #dc3545;
-            animation: pulse 2s infinite;
-        }
-
-        .status-dot.connected {
             background: #28a745;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
         }
 
         .session-id {
@@ -116,6 +106,7 @@
             max-width: 80%;
             word-wrap: break-word;
             line-height: 1.5;
+            white-space: pre-wrap;
         }
 
         .message.user .message-content {
@@ -136,6 +127,15 @@
             background: #fff3cd;
             color: #856404;
             border: 1px solid #ffeaa7;
+            margin: 0 auto;
+            text-align: center;
+            font-size: 14px;
+        }
+
+        .message.error .message-content {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
             margin: 0 auto;
             text-align: center;
             font-size: 14px;
@@ -188,7 +188,7 @@
             transition: transform 0.2s, box-shadow 0.2s;
         }
 
-        #sendButton:hover {
+        #sendButton:hover:not(:disabled) {
             transform: translateY(-2px);
             box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
         }
@@ -223,6 +223,20 @@
         .control-button:hover {
             background: #5a6268;
         }
+
+        .loading {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid #667eea;
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
@@ -234,16 +248,16 @@
 
         <div class="status">
             <div class="status-indicator">
-                <div class="status-dot" id="statusDot"></div>
-                <span id="statusText">Disconnected</span>
+                <div class="status-dot"></div>
+                <span>Ready</span>
             </div>
-            <div class="session-id" id="sessionId">Session: Not connected</div>
+            <div class="session-id" id="sessionId">Session: <span id="sessionIdValue"></span></div>
         </div>
 
         <div class="messages" id="messages">
             <div class="message system">
                 <div class="message-content">
-                    Welcome! Click "Connect" to start chatting with the AI agents.
+                    Welcome! Start chatting with the AI agents.
                 </div>
             </div>
         </div>
@@ -254,34 +268,36 @@
                     type="text" 
                     id="messageInput" 
                     placeholder="Type your message here..." 
-                    disabled
                 />
-                <button id="sendButton" disabled>Send</button>
+                <button id="sendButton">Send</button>
             </div>
             <div class="controls">
-                <button class="control-button" id="connectButton">Connect</button>
-                <button class="control-button" id="disconnectButton" disabled>Disconnect</button>
                 <button class="control-button" id="clearButton">Clear Chat</button>
+                <button class="control-button" id="newSessionButton">New Session</button>
             </div>
         </div>
     </div>
 
     <script>
-        let ws = null;
-        let sessionId = null;
+        let sessionId = generateSessionId();
+        let isProcessing = false;
 
+        const API_BASE_URL = 'http://localhost:8000';
         const messagesDiv = document.getElementById('messages');
         const messageInput = document.getElementById('messageInput');
         const sendButton = document.getElementById('sendButton');
-        const connectButton = document.getElementById('connectButton');
-        const disconnectButton = document.getElementById('disconnectButton');
         const clearButton = document.getElementById('clearButton');
-        const statusDot = document.getElementById('statusDot');
-        const statusText = document.getElementById('statusText');
-        const sessionIdDisplay = document.getElementById('sessionId');
+        const newSessionButton = document.getElementById('newSessionButton');
+        const sessionIdValue = document.getElementById('sessionIdValue');
 
         function generateSessionId() {
             return 'session_' + Math.random().toString(36).substr(2, 9);
+        }
+
+        function initSession() {
+            sessionId = generateSessionId();
+            sessionIdValue.textContent = sessionId;
+            console.log('Session initialized:', sessionId);
         }
 
         function addMessage(type, content, metadata = {}) {
@@ -308,103 +324,86 @@
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
 
-        function updateStatus(connected) {
-            if (connected) {
-                statusDot.classList.add('connected');
-                statusText.textContent = 'Connected';
-                messageInput.disabled = false;
-                sendButton.disabled = false;
-                connectButton.disabled = true;
-                disconnectButton.disabled = false;
-                sessionIdDisplay.textContent = `Session: ${sessionId}`;
+        function setProcessing(processing) {
+            isProcessing = processing;
+            sendButton.disabled = processing;
+            messageInput.disabled = processing;
+            
+            if (processing) {
+                sendButton.innerHTML = '<span class="loading"></span>';
             } else {
-                statusDot.classList.remove('connected');
-                statusText.textContent = 'Disconnected';
-                messageInput.disabled = true;
-                sendButton.disabled = true;
-                connectButton.disabled = false;
-                disconnectButton.disabled = true;
-                sessionIdDisplay.textContent = 'Session: Not connected';
+                sendButton.textContent = 'Send';
             }
         }
 
-        function connect() {
-            sessionId = generateSessionId();
-            const wsUrl = `ws://localhost:8000/ws/${sessionId}`;
-
-            ws = new WebSocket(wsUrl);
-
-            ws.onopen = () => {
-                console.log('WebSocket connected');
-                updateStatus(true);
-            };
-
-            ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                console.log('Received:', data);
-
-                if (data.type === 'system') {
-                    addMessage('system', data.content);
-                } else if (data.type === 'agent_response') {
-                    addMessage('agent', data.content, data.metadata);
-                } else if (data.type === 'error') {
-                    addMessage('system', `Error: ${data.content}`);
-                }
-            };
-
-            ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                addMessage('system', 'Connection error occurred');
-            };
-
-            ws.onclose = () => {
-                console.log('WebSocket disconnected');
-                updateStatus(false);
-                ws = null;
-            };
-        }
-
-        function disconnect() {
-            if (ws) {
-                ws.close();
-                ws = null;
-            }
-        }
-
-        function sendMessage() {
+        async function sendMessage() {
             const message = messageInput.value.trim();
-            if (!message || !ws) return;
+            if (!message || isProcessing) return;
 
-            const data = {
-                type: 'user_message',
-                content: message,
-                session_id: sessionId
-            };
-
-            ws.send(JSON.stringify(data));
+            // Add user message to UI
             addMessage('user', message);
             messageInput.value = '';
+            setProcessing(true);
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/chat/${sessionId}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        content: message
+                    })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Request failed');
+                }
+
+                const data = await response.json();
+                console.log('Received:', data);
+
+                // Add agent response to UI
+                addMessage('agent', data.response, {
+                    agent: data.metadata.agent,
+                    intent: data.intent
+                });
+
+            } catch (error) {
+                console.error('Error:', error);
+                addMessage('error', `Error: ${error.message}`);
+            } finally {
+                setProcessing(false);
+                messageInput.focus();
+            }
+        }
+
+        function clearChat() {
+            messagesDiv.innerHTML = '';
+            addMessage('system', 'Chat cleared');
+        }
+
+        function newSession() {
+            initSession();
+            clearChat();
+            addMessage('system', `New session started: ${sessionId}`);
         }
 
         // Event listeners
-        connectButton.addEventListener('click', connect);
-        disconnectButton.addEventListener('click', disconnect);
-        clearButton.addEventListener('click', () => {
-            messagesDiv.innerHTML = '';
-            addMessage('system', 'Chat cleared');
-        });
-
         sendButton.addEventListener('click', sendMessage);
         messageInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
+            if (e.key === 'Enter' && !isProcessing) {
                 sendMessage();
             }
         });
 
-        // Auto-connect on load
+        clearButton.addEventListener('click', clearChat);
+        newSessionButton.addEventListener('click', newSession);
+
+        // Initialize on load
         window.addEventListener('load', () => {
-            // Uncomment to auto-connect
-            // connect();
+            initSession();
         });
     </script>
 </body>

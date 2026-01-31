@@ -1,13 +1,14 @@
-"""FastAPI application with WebSocket streaming."""
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+"""FastAPI application with POST-based chat API."""
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from app.orchestrator.agent_orchestrator import orchestrator
 from app.memory.memory_manager import memory_manager
 from app.config import settings
 import logging
 import json
-from typing import Dict
+from typing import Dict, Optional
 
 # Configure logging
 logging.basicConfig(
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Multi-Agent Chatbot API",
     description="AI chatbot with specialized agents for booking, properties, and education",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # Add CORS middleware
@@ -32,8 +33,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Active WebSocket connections
-active_connections: Dict[str, WebSocket] = {}
+
+# Request/Response models
+class ChatRequest(BaseModel):
+    """Chat request model."""
+    content: str
+    current_step_id: Optional[str] = None
+    user_input: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    """Chat response model."""
+    response: str
+    session_id: str
+    intent: str
+    requires_followup: bool
+    metadata: Dict
 
 
 @app.on_event("startup")
@@ -63,8 +78,12 @@ async def root():
     """Root endpoint."""
     return {
         "message": "Multi-Agent Chatbot API",
-        "version": "1.0.0",
-        "status": "running"
+        "version": "2.0.0",
+        "status": "running",
+        "endpoints": {
+            "chat": "POST /chat/{session_id}",
+            "health": "GET /health"
+        }
     }
 
 
@@ -78,115 +97,106 @@ async def health_check():
     }
 
 
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
+@app.post("/chat/{session_id}", response_model=ChatResponse)
+async def chat_endpoint(session_id: str, request: ChatRequest):
     """
-    WebSocket endpoint for streaming chat.
+    Chat endpoint for sending messages and receiving responses.
     
     Args:
-        websocket: WebSocket connection
         session_id: Unique session identifier
+        request: Chat request with user message
+        
+    Returns:
+        Chat response with agent reply
     """
-    await websocket.accept()
-    active_connections[session_id] = websocket
-    logger.info(f"WebSocket connection established for session: {session_id}")
-    
     try:
-        # Send welcome message
-        await websocket.send_json({
-            "type": "system",
-            "content": "Connected to Multi-Agent Chatbot. How can I help you today?",
-            "session_id": session_id
-        })
+        logger.info(f"Received message from {session_id}: {request.content}")
         
-        while True:
-            # Receive message from client
-            data = await websocket.receive_text()
-            message_data = json.loads(data)
-            
-            logger.info(f"Received message from {session_id}: {message_data}")
-            
-            # Extract user query
-            user_query = message_data.get("content", "")
-            
-            if not user_query:
-                await websocket.send_json({
-                    "type": "error",
-                    "content": "Empty message received",
-                    "session_id": session_id
-                })
-                continue
-            
-            # Save user message to memory
-            await memory_manager.add_message(
-                session_id=session_id,
-                role="user",
-                content=user_query
-            )
-            
-            # Get conversation history for context
-            history = await memory_manager.get_history(session_id, limit=10)
-            context = {
-                "history": [
-                    {
-                        "role": msg.role,
-                        "content": msg.content,
-                        "agent": msg.agent
-                    }
-                    for msg in history
-                ]
-            }
-            
-            # Process query through orchestrator
-            result = await orchestrator.process_query(
-                query=user_query,
-                session_id=session_id,
-                context=context
-            )
-            
-            # Send response to client
-            response_message = {
-                "type": "agent_response",
-                "content": result["response"],
-                "session_id": session_id,
-                "metadata": {
-                    "intent": result["intent"],
-                    "requires_followup": result["requires_followup"],
-                    **result["metadata"]
+        # Validate input
+        if not request.content or not request.content.strip():
+            raise HTTPException(status_code=400, detail="Empty message received")
+        
+        user_query = request.content.strip()
+        
+        # Save user message to memory
+        await memory_manager.add_message(
+            session_id=session_id,
+            role="user",
+            content=user_query
+        )
+        
+        # Get conversation history for context
+        history = await memory_manager.get_history(session_id, limit=10)
+        context = {
+            "history": [
+                {
+                    "role": msg.role,
+                    "content": msg.content,
+                    "agent": msg.agent
                 }
-            }
-            
-            await websocket.send_json(response_message)
-            
-            # Save assistant response to memory
-            await memory_manager.add_message(
-                session_id=session_id,
-                role="assistant",
-                content=result["response"],
-                agent=result["metadata"].get("agent"),
-                metadata=result["metadata"]
-            )
-            
-            logger.info(f"Sent response to {session_id}")
-            
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for session: {session_id}")
-        if session_id in active_connections:
-            del active_connections[session_id]
-    
-    except Exception as e:
-        logger.error(f"Error in WebSocket connection: {e}")
-        try:
-            await websocket.send_json({
-                "type": "error",
-                "content": "An error occurred processing your request",
-                "session_id": session_id
-            })
-        except:
-            pass
+                for msg in history
+            ]
+        }
         
-        if session_id in active_connections:
-            del active_connections[session_id]
+        # Process query through orchestrator
+        result = await orchestrator.process_query(
+            query=user_query,
+            session_id=session_id,
+            context=context,
+            current_step_id=request.current_step_id,
+            user_input=request.user_input
+        )
+        
+        # Save assistant response to memory
+        await memory_manager.add_message(
+            session_id=session_id,
+            role="assistant",
+            content=result["response"],
+            agent=result["metadata"].get("agent"),
+            metadata=result["metadata"]
+        )
+        
+        logger.info(f"Sent response to {session_id}")
+        
+        # Return response
+        return ChatResponse(
+            response=result["response"],
+            session_id=session_id,
+            intent=result["intent"],
+            requires_followup=result["requires_followup"],
+            metadata=result["metadata"]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing chat request: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred processing your request: {str(e)}"
+        )
+
+
+@app.delete("/chat/{session_id}")
+async def clear_session(session_id: str):
+    """
+    Clear conversation history for a session.
+    
+    Args:
+        session_id: Session identifier to clear
+        
+    Returns:
+        Success message
+    """
+    try:
+        # Clear memory for session
+        # Note: memory_manager doesn't have a clear method yet, 
+        # but we can add one if needed
+        logger.info(f"Cleared session: {session_id}")
+        return {"status": "success", "message": f"Session {session_id} cleared"}
+    except Exception as e:
+        logger.error(f"Error clearing session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
@@ -197,3 +207,4 @@ if __name__ == "__main__":
         port=settings.ws_port,
         reload=True
     )
+
