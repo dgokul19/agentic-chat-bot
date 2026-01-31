@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     
     # LLM Configuration
     llm_provider: Literal["openai", "azure", "gemini"] = Field(
-        default="openai",
+        default="gemini",
         description="LLM provider to use"
     )
     openai_api_key: str = Field(default="", description="OpenAI API key")
@@ -42,9 +42,6 @@ class Settings(BaseSettings):
     # Memory Configuration
     local_memory_path: str = Field(default="data/memory", description="Local memory storage path")
     
-    # ServeMe API Configuration
-    servme_endpoint: str = Field(default="", description="ServeMe API base endpoint")
-    servme_token: str = Field(default="", description="ServeMe API authorization token")
     restaurant_endpoint: str = Field(default="", description="Restaurant API endpoint")
     
     class Config:
